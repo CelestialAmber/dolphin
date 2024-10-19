@@ -227,8 +227,8 @@ void PPCSymbolDB::LogFunctionCall(u32 addr)
 // bad=true means carefully load map files that might not be from exactly the right version
 bool PPCSymbolDB::LoadMap(const Core::CPUThreadGuard& guard, const std::string& filename, bool bad)
 {
-  File::IOFile f(filename, "r");
-  if (!f)
+  std::ifstream f(filename);
+  if (!f.good())
     return false;
 
   // Two columns are used by Super Smash Bros. Brawl Korean map file
@@ -238,22 +238,22 @@ bool PPCSymbolDB::LoadMap(const Core::CPUThreadGuard& guard, const std::string& 
   int good_count = 0;
   int bad_count = 0;
 
-  char line[512];
+  std::string line;
   std::string section_name;
-  while (fgets(line, 512, f.GetHandle()))
+  while (std::getline(f, line))
   {
-    size_t length = strlen(line);
+    size_t length = line.length();
     if (length < 4)
       continue;
 
     char temp[256]{};
-    sscanf(line, "%255s", temp);
+    sscanf(line.c_str(), "%255s", temp);
 
     if (strcmp(temp, "UNUSED") == 0)
       continue;
 
     // Support CodeWarrior and Dolphin map
-    if (std::string_view{line}.ends_with(" section layout\n") || strcmp(temp, ".text") == 0 ||
+    if (line.ends_with(" section layout") || strcmp(temp, ".text") == 0 ||
         strcmp(temp, ".init") == 0)
     {
       section_name = temp;
@@ -272,7 +272,7 @@ bool PPCSymbolDB::LoadMap(const Core::CPUThreadGuard& guard, const std::string& 
       continue;
     if (strcmp(temp, "address") == 0)
       continue;
-    if (strcmp(temp, "-----------------------") == 0)
+    if (strstr(temp, "-----------------------") != nullptr)
       continue;
 
     // Skip link map.
@@ -295,14 +295,15 @@ bool PPCSymbolDB::LoadMap(const Core::CPUThreadGuard& guard, const std::string& 
     if (section_name.empty())
       continue;
 
+    const std::string stripped_line(StripWhitespace(line));
+    std::istringstream iss(stripped_line);
+
     // Column detection heuristic
     if (column_count == 0)
     {
       constexpr auto is_hex_str = [](const std::string& s) {
         return !s.empty() && s.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos;
       };
-      const std::string stripped_line(StripWhitespace(line));
-      std::istringstream iss(stripped_line);
       iss.imbue(std::locale::classic());
       std::string word;
 
@@ -330,66 +331,112 @@ bool PPCSymbolDB::LoadMap(const Core::CPUThreadGuard& guard, const std::string& 
     }
 
     u32 address, vaddress, size, offset, alignment;
-    char name[512], container[512];
-    if (column_count == 4)
+    std::string name_string = "";
+    std::string object_filename_string = "";
+    if (column_count == 3 || column_count == 4)
     {
-      // sometimes there is no alignment value, and sometimes it is because it is an entry of
-      // something else
-      if (length > 37 && line[37] == ' ')
+      std::string line_temp;
+
+      iss.clear();
+      iss.str(stripped_line);
+
+      iss >> std::hex >> address;
+      iss >> std::hex >> size;
+      iss >> std::hex >> vaddress;
+
+      if (column_count == 4)
       {
-        alignment = 0;
-        sscanf(line, "%08x %08x %08x %08x %511s", &address, &size, &vaddress, &offset, name);
-        char* s = strstr(line, "(entry of ");
-        if (s)
+        iss >> std::hex >> offset;
+      }
+
+      // If any of the values failed to be parsed, the line is invalid
+      if (!iss)
+        continue;
+
+      std::getline(iss, line_temp);
+      iss.clear();
+
+      // Skip whitespace
+      line_temp = line_temp.substr(line_temp.find_first_not_of(' '));
+
+      // If the next character is a digit (alignment value is present),
+      // read it
+      if (std::isdigit(line_temp[0]))
+      {
+        iss.str(line_temp);
+        iss >> alignment;
+        std::getline(iss, line_temp);
+        iss.clear();
+        line_temp = line_temp.substr(line_temp.find_first_not_of(' '));
+      }
+
+      // Split the current name string into separate parts, and get the object name
+      // if it exists.
+      std::string processed_name = TabsToSpaces(0, line_temp);  // Remove tabs
+      std::vector<std::string> parts = SplitString(processed_name, ' ');
+      size_t num_parts = parts.size();
+
+      if (num_parts > 0)
+      {
+        // If the first part does not contain a left bracket (not a demangled symbol), use the first
+        // part
+        size_t parenthesis_offset = parts[0].find('(');
+        if (parenthesis_offset == std::string::npos)
         {
-          sscanf(s + 10, "%511s", container);
-          char* s2 = (strchr(container, ')'));
-          if (s2 && container[0] != '.')
+          name_string = parts[0];
+        }
+        else
+        {
+          // If it does, the symbol is likely demangled, so look for the end of the name (only
+          // required for silly Wii Twilight Princess maps :p)
+          size_t name_offset = parenthesis_offset;
+          while (line_temp[name_offset] != ')')
           {
-            s2[0] = '\0';
-            strcat(container, "::");
-            strcat(container, name);
-            strcpy(name, container);
+            name_offset++;
+          }
+
+          name_offset++;  // Advance past the ending parenthesis
+
+          // If the name ends with const, advance past it
+          if (line_temp.find(" const") != std::string::npos)
+          {
+            name_offset += 6;
+          }
+
+          name_string = line_temp.substr(0, name_offset);
+        }
+
+        // If the last part contains a ., it has to be the object name
+        if (parts[num_parts - 1].find('.') != std::string::npos)
+        {
+          object_filename_string = parts[num_parts - 1];
+        }
+
+        // Parse the other parts
+        for (int i = 0; i < num_parts; i++)
+        {
+          // Handle (entry of ...) some symbols have
+          if (parts[i] == "(entry")
+          {
+            std::string entryOfName = parts[i + 2];
+            entryOfName.pop_back();  // Remove ')' at the end
+
+            if (!entryOfName.starts_with('.'))
+            {
+              name_string = entryOfName + "::" + name_string;
+            }
           }
         }
-      }
-      else
-      {
-        sscanf(line, "%08x %08x %08x %08x %i %511s", &address, &size, &vaddress, &offset,
-               &alignment, name);
-      }
-    }
-    else if (column_count == 3)
-    {
-      // some entries in the table have a function name followed by " (entry of " followed by a
-      // container name, followed by ")"
-      // instead of a space followed by a number followed by a space followed by a name
-      if (length > 27 && line[27] != ' ' && strstr(line, "(entry of "))
-      {
-        alignment = 0;
-        sscanf(line, "%08x %08x %08x %511s", &address, &size, &vaddress, name);
-        char* s = strstr(line, "(entry of ");
-        if (s)
-        {
-          sscanf(s + 10, "%511s", container);
-          char* s2 = (strchr(container, ')'));
-          if (s2 && container[0] != '.')
-          {
-            s2[0] = '\0';
-            strcat(container, "::");
-            strcat(container, name);
-            strcpy(name, container);
-          }
-        }
-      }
-      else
-      {
-        sscanf(line, "%08x %08x %08x %i %511s", &address, &size, &vaddress, &alignment, name);
       }
     }
     else if (column_count == 2)
     {
-      sscanf(line, "%08x %511s", &address, name);
+      iss.clear();
+      iss.str(stripped_line);
+
+      iss >> address;
+      iss >> name_string;
+
       vaddress = address;
       size = 0;
     }
@@ -397,40 +444,9 @@ bool PPCSymbolDB::LoadMap(const Core::CPUThreadGuard& guard, const std::string& 
     {
       break;
     }
-    const char* namepos = strstr(line, name);
-    if (namepos != nullptr)  // would be odd if not :P
-      strcpy(name, namepos);
-    name[strlen(name) - 1] = 0;
-    if (name[strlen(name) - 1] == '\r')
-      name[strlen(name) - 1] = 0;
-
-    // Split the current name string into separate parts, and get the object name
-    // if it exists.
-    std::string processed_name = TabsToSpaces(0, name);  // Remove tabs
-    std::vector<std::string> parts = SplitString(processed_name, ' ');
-    size_t num_parts = parts.size();
-
-    std::string object_filename_string = "";
-    std::string name_string = name; // Default to the full line
-
-    if (num_parts > 0)
-    {
-      // If the first part does not contain a left bracket (not a demangled symbol), use the first
-      // part
-      if (parts[0].find('(') == std::string::npos)
-      {
-        name_string = parts[0];
-      }
-
-      // If the last part contains a ., it has to be the object name
-      if (parts[num_parts - 1].find('.') != std::string::npos)
-      {
-        object_filename_string = parts[num_parts - 1];
-      }
-    }
 
     // Check if this is a valid entry.
-    if (strlen(name) > 0)
+    if (name_string.length() > 0)
     {
       bool good;
       const Common::Symbol::Type type = section_name == ".text" || section_name == ".init" ?
